@@ -1,0 +1,21 @@
+{
+  "name": "gpu-profiler-generic",
+  "version": "1.0.0",
+  "description": "通用GPU性能分析工具 - 支持CUDA、AMD、Intel和OMP架构",
+  "author": "hongyan19890126",
+  "source": "github",
+  "repository": "https://github.com/hongyan19890126/gpu-profiler-generic",
+  "keywords": ["gpu", "profiler", "cuda", "amd", "intel", "omp", "performance"],
+  "tools": {
+    "python": {
+      "script": "generate_report.py"
+    }
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "generate_report.py"
+  ],
+  "dependencies": [],
+  "installed_at": "2026-04-29"
+}

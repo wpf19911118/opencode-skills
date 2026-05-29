@@ -1,0 +1,23 @@
+{
+  "skill_name": "sglang-log-analyze",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我有一个 sglang 的日志文件在 agent-ana/ubuntu_0.log，请帮我分析这个日志文件，找出系统提示词请求并生成分析报告",
+      "expected_output": "Markdown report containing: 1) Request overview table with RID, type, tokens, 2) Component distribution table showing system/skills/tools breakdown, 3) Tools analysis with top 5 tools by size, 4) Key findings summary",
+      "files": ["agent-ana/ubuntu_0.log"]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我分析 agent-ana/ 目录下的 a7_0.log 文件，计算系统提示词各部分的 token 开销比例，重点关注 Tools JSONSchema 定义占多少比例",
+      "expected_output": "Analysis report showing: token breakdown by component, percentage distribution, specific numbers for tools section",
+      "files": ["agent-ana/a7_0.log"]
+    },
+    {
+      "id": 3,
+      "prompt": "我需要了解当前对话中模型收到多少 token 的系统提示词，这会影响后续的对话成本。请分析最近的日志",
+      "expected_output": "Token count for system prompt components, total system prompt tokens, impact on cost estimation",
+      "files": []
+    }
+  ]
+}

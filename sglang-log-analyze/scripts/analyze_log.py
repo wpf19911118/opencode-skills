@@ -6,6 +6,8 @@ Analyzes LLM API request logs to extract system prompts and calculate token over
 
 Usage:
     python analyze_log.py <log_file> [--rid <request_id>] [--output <output_dir>]
+    python analyze_log.py <log_file> --segment                    # Segment user questions
+    python analyze_log.py <log_file> --segment --output <dir>     # Save segmentation report
 """
 
 import argparse
@@ -14,7 +16,315 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, NamedTuple
+
+
+@dataclass
+class QuestionGroup:
+    """A group of API calls representing one user question"""
+    timestamp: str
+    api_calls: int
+    user_message: str
+    session_index: int
+
+
+class Session(NamedTuple):
+    """A single API session (request.received.openai + request.finished)"""
+    rid: str
+    timestamp: str
+    request_type: str
+    user_message: str
+
+
+def segment_user_questions(log_path: str, time_gap_threshold: float = 60.0) -> tuple[list[Session], list[QuestionGroup]]:
+    """
+    Segment log into user questions based on time gap.
+    
+    Args:
+        log_path: Path to JSONL log file
+        time_gap_threshold: Seconds between requests to consider new question (default: 60s)
+    
+    Returns:
+        Tuple of (sessions, question_groups)
+    """
+    lines = Path(log_path).read_text(encoding="utf-8").splitlines()
+    
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line.strip()))
+        except json.JSONDecodeError:
+            continue
+    
+    # Group events by session
+    sessions = []
+    current_session = []
+    
+    for e in events:
+        if e.get("event") == "request.received.openai":
+            if current_session:
+                sessions.append(current_session)
+            current_session = [e]
+        elif e.get("event") == "request.finished":
+            current_session.append(e)
+    
+    if current_session:
+        sessions.append(current_session)
+    
+    # Extract sessions with user messages
+    extracted_sessions = []
+    for session in sessions:
+        req_openai = session[0]
+        messages = req_openai.get("obj", {}).get("messages", [])
+        
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                # Only process agent requests (exclude title_generator)
+                if "opencode" in content.lower() and "title generator" not in content.lower():
+                    # Find last user message
+                    for m in reversed(messages):
+                        if m.get("role") == "user":
+                            extracted_sessions.append(Session(
+                                rid=req_openai.get("obj", {}).get("rid", ""),
+                                timestamp=req_openai.get("timestamp", ""),
+                                request_type="agent_request",
+                                user_message=m.get("content", "")
+                            ))
+                            break
+                    break
+    
+    # Group by time gap
+    question_groups = []
+    current_group = []
+    prev_ts = None
+    
+    for sess in extracted_sessions:
+        ts = datetime.fromisoformat(sess.timestamp[:19])
+        if prev_ts:
+            diff = (ts - prev_ts).total_seconds()
+            if diff > time_gap_threshold:
+                if current_group:
+                    question_groups.append(current_group)
+                current_group = [sess]
+            else:
+                current_group.append(sess)
+        else:
+            current_group = [sess]
+        prev_ts = ts
+    
+    if current_group:
+        question_groups.append(current_group)
+    
+    return extracted_sessions, question_groups
+
+
+def generate_segmentation_report(log_path: str, time_gap: float = 60.0) -> str:
+    """Generate user questions segmentation report"""
+    sessions, question_groups = segment_user_questions(log_path, time_gap)
+    
+    report = []
+    report.append("# User Questions Segmentation Report\n")
+    report.append(f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    report.append("---\n\n")
+    
+    report.append("## Summary\n\n")
+    report.append(f"- **Total sessions**: {len(sessions)}\n")
+    report.append(f"- **Question groups** (time gap > {time_gap}s): {len(question_groups)}\n")
+    report.append(f"- **Time gap threshold**: {time_gap}s\n\n")
+    
+    for gi, group in enumerate(question_groups, 1):
+        first_sess = group[0]
+        report.append("---\n\n")
+        report.append(f"## Question {gi}\n\n")
+        report.append(f"- **Timestamp**: {first_sess.timestamp[:19]}\n")
+        report.append(f"- **API calls**: {len(group)}\n")
+        report.append("\n### User Question:\n\n")
+        report.append(first_sess.user_message[:500])
+        if len(first_sess.user_message) > 500:
+            report.append("\n```\n[truncated...]\n```")
+        report.append("\n")
+    
+    report.append("\n---\n")
+    report.append("*Report generated by sglang-log-analyze skill*\n")
+    
+    return "".join(report)
+
+
+def generate_detailed_stats_report(log_path: str, time_gap: float = 60.0) -> str:
+    """Generate detailed statistics report with per-call token info"""
+    lines = Path(log_path).read_text(encoding='utf-8').splitlines()
+    
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line.strip()))
+        except json.JSONDecodeError:
+            continue
+    
+    # Pair request.received.openai with request.finished
+    sessions = []
+    pending_openai = None
+    
+    for e in events:
+        if e.get('event') == 'request.received.openai':
+            pending_openai = e
+        elif e.get('event') == 'request.finished' and pending_openai:
+            meta_info = e.get('out', {}).get('meta_info', {})
+            sessions.append({
+                'timestamp': pending_openai.get('timestamp', ''),
+                'messages': pending_openai.get('obj', {}).get('messages', []),
+                'prompt_tokens': meta_info.get('prompt_tokens', 0),
+                'completion_tokens': meta_info.get('completion_tokens', 0)
+            })
+            pending_openai = None
+    
+    # Filter agent_request sessions
+    agent_sessions = []
+    for sess in sessions:
+        messages = sess.get('messages', [])
+        user_msg = ''
+        tool_count = 0
+        
+        for msg in messages:
+            role = msg.get('role', '')
+            if role == 'system':
+                content = msg.get('content', '')
+                if 'opencode' in content.lower() and 'title generator' not in content.lower():
+                    sess['is_agent'] = True
+            elif role == 'user':
+                user_msg = msg.get('content', '')
+            elif role == 'tool':
+                tool_count += 1
+        
+        if sess.get('is_agent', False):
+            sess['user_message'] = user_msg
+            sess['tool_count'] = tool_count
+            agent_sessions.append(sess)
+    
+    # Group by time gap
+    prev_ts = None
+    question_groups = []
+    current_group = []
+    
+    for sess in agent_sessions:
+        ts = datetime.fromisoformat(sess['timestamp'][:19])
+        if prev_ts:
+            diff = (ts - prev_ts).total_seconds()
+            if diff > time_gap:
+                if current_group:
+                    question_groups.append(current_group)
+                current_group = [sess]
+            else:
+                current_group.append(sess)
+        else:
+            current_group = [sess]
+        prev_ts = ts
+    
+    if current_group:
+        question_groups.append(current_group)
+    
+    # Generate report
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    total_llm = len(agent_sessions)
+    total_tools = sum(s['tool_count'] for s in agent_sessions)
+    total_prompt = sum(s['prompt_tokens'] for s in agent_sessions)
+    total_completion = sum(s['completion_tokens'] for s in agent_sessions)
+    
+    report = []
+    report.append("# SGLang Log 用户问题详细统计分析\n")
+    report.append("\n")
+    report.append(f"**Generated**: {now_str}\n")
+    report.append("\n---\n")
+    report.append("\n## 统计摘要\n")
+    report.append("\n")
+    report.append("| 指标 | 值 |\n")
+    report.append("|------|----|\n")
+    report.append(f"| 总 API 会话数 | {len(sessions)} |\n")
+    report.append(f"| Agent 请求数 | {total_llm} |\n")
+    report.append(f"| 用户问题数 | {len(question_groups)} |\n")
+    report.append(f"| 总 LLM 调用次数 | {total_llm} |\n")
+    report.append(f"| 总 Tool 调用次数 | {total_tools} |\n")
+    report.append(f"| 总输入 Tokens | {total_prompt:,} |\n")
+    report.append(f"| 总输出 Tokens | {total_completion:,} |\n")
+    report.append(f"| 总 Tokens 消耗 | {total_prompt + total_completion:,} |\n")
+    report.append(f"| 平均输入/次 | {total_prompt // total_llm if total_llm > 0 else 0:,} |\n")
+    report.append(f"| 平均输出/次 | {total_completion // total_llm if total_llm > 0 else 0:,} |\n")
+    report.append("\n")
+    
+    for gi, group in enumerate(question_groups, 1):
+        first = group[0]
+        report.append("---\n")
+        report.append("\n")
+        report.append(f"## 问题 {gi}\n")
+        report.append("\n")
+        report.append(f"**时间**: {first['timestamp'][:19]}\n")
+        report.append("\n")
+        report.append("**用户问题** (前200字):\n")
+        report.append("\n")
+        preview = first['user_message'][:200]
+        if len(first['user_message']) > 200:
+            preview += '...'
+        report.append("```\n")
+        report.append(preview + "\n")
+        report.append("```\n")
+        report.append("\n")
+        
+        q_llm = len(group)
+        q_tools = sum(s['tool_count'] for s in group)
+        q_prompt = sum(s['prompt_tokens'] for s in group)
+        q_completion = sum(s['completion_tokens'] for s in group)
+        q_total = q_prompt + q_completion
+        avg_prompt = q_prompt // q_llm if q_llm > 0 else 0
+        avg_completion = q_completion // q_llm if q_llm > 0 else 0
+        
+        report.append("### 统计信息\n")
+        report.append("\n")
+        report.append("| 指标 | 值 |\n")
+        report.append("|------|----|\n")
+        report.append(f"| LLM 调用次数 | {q_llm} |\n")
+        report.append(f"| Tool 调用次数 | {q_tools} |\n")
+        report.append(f"| 输入 Tokens 总计 | {q_prompt:,} |\n")
+        report.append(f"| 输出 Tokens 总计 | {q_completion:,} |\n")
+        report.append(f"| Tokens 总消耗 | {q_total:,} |\n")
+        report.append(f"| 平均每次输入 Tokens | {avg_prompt:,} |\n")
+        report.append(f"| 平均每次输出 Tokens | {avg_completion:,} |\n")
+        report.append("\n")
+        
+        report.append("### 每次 LLM 调用详情\n")
+        report.append("\n")
+        report.append("| # | 时间戳 | Prompt Tokens | Completion Tokens | 总 Tokens | Tool Calls |\n")
+        report.append("|---|--------|---------------|-------------------|-----------|------------|\n")
+        
+        for ci, sess in enumerate(group, 1):
+            ts = sess['timestamp'][11:19]
+            call_total = sess['prompt_tokens'] + sess['completion_tokens']
+            report.append(f"| {ci} | {ts} | {sess['prompt_tokens']:,} | {sess['completion_tokens']:,} | {call_total:,} | {sess['tool_count']} |\n")
+        
+        report.append("\n")
+    
+    # Token consumption ranking
+    report.append("---\n")
+    report.append("\n## Token 消耗排名 (按问题)\n")
+    report.append("\n")
+    report.append("| 排名 | 问题 | 输入 Tokens | 输出 Tokens | 总 Tokens |\n")
+    report.append("|------|------|-------------|-------------|-----------|\n")
+    
+    ranked = []
+    for gi, group in enumerate(question_groups, 1):
+        total = sum(s['prompt_tokens'] + s['completion_tokens'] for s in group)
+        prompt = sum(s['prompt_tokens'] for s in group)
+        completion = sum(s['completion_tokens'] for s in group)
+        ranked.append((gi, total, prompt, completion))
+    
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    for rank, (gi, total, prompt, completion) in enumerate(ranked, 1):
+        report.append(f"| {rank} | 问题 {gi} | {prompt:,} | {completion:,} | {total:,} |\n")
+    
+    report.append("\n---\n")
+    report.append("\n*报告由 sglang-log-analyze 技能生成*\n")
+    
+    return "".join(report)
 
 
 @dataclass
@@ -290,8 +600,45 @@ def main():
     parser.add_argument("--rid", help="Specific request ID to analyze")
     parser.add_argument("--output", "-o", help="Output directory for reports")
     parser.add_argument("--type", help="Filter by request type (agent_request, skill_load, etc.)")
+    parser.add_argument("--segment", action="store_true", help="Segment user questions by time gap")
+    parser.add_argument("--stats", action="store_true", help="Generate detailed statistics report")
+    parser.add_argument("--time-gap", type=float, default=60.0, help="Time gap threshold in seconds (default: 60)")
     
     args = parser.parse_args()
+    
+    # Handle stats mode
+    if args.stats:
+        report = generate_detailed_stats_report(args.log_file, args.time_gap)
+        print(report)
+        
+        if args.output:
+            output_dir = Path(args.output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = output_dir / f"detailed_stats_{timestamp}.md"
+            
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(report)
+            
+            print(f"\nReport saved to: {output_file}")
+        return
+    
+    # Handle segmentation mode
+    if args.segment:
+        report = generate_segmentation_report(args.log_file, args.time_gap)
+        print(report)
+        
+        if args.output:
+            output_dir = Path(args.output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = output_dir / f"segmentation_{timestamp}.md"
+            
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(report)
+            
+            print(f"\nReport saved to: {output_file}")
+        return
     
     records = parse_log_file(args.log_file, args.rid)
     

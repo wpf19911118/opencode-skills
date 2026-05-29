@@ -1,0 +1,33 @@
+{
+  "name": "paper-translator",
+  "version": "1.0.0",
+  "description": "AI驱动的学术论文阅读与翻译系统 - PDF文本提取、目录识别、多语言翻译",
+  "author": "wpf19911118",
+  "source": "github",
+  "repository": "https://github.com/wpf19911118/paper-translator",
+  "keywords": ["pdf", "translation", "academic", "paper", "nlp"],
+  "tools": {
+    "python": {
+      "package": "src/pdf_reader.py",
+      "requirements": "requirements.txt"
+    }
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "docs/QUICKSTART.md",
+    "docs/WORKFLOW_GUIDE.md",
+    "src/pdf_reader.py",
+    "src/terminology/template.md",
+    "templates/zh_translation.md",
+    "templates/en_translation.md",
+    "templates/jp_translation.md"
+  ],
+  "dependencies": [
+    "pypdf>=4.0.0",
+    "PyMuPDF>=1.24.0",
+    "pillow>=10.0.0"
+  ],
+  "installed_at": "2026-04-29",
+  "release": "https://github.com/wpf19911118/paper-translator/releases/tag/v1.0.0"
+}
